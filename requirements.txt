@@ -1,0 +1,6 @@
+streamlit
+PyMuPDF
+pdfplumber
+python-docx
+anthropic
+reportlab
