@@ -102,6 +102,7 @@ with ctrl_col3:
         step=0.5,
         key="relevance_threshold",
     )
+    count_placeholder = st.empty()
 
 with ctrl_col4:
     lang = st.radio(
@@ -125,11 +126,13 @@ with ctrl_col5:
     )
 
 # ---------------------------------------------------------------------------
-# Filtering
+# Filtering — use active persona for relevance score
 # ---------------------------------------------------------------------------
+active_persona: str = persona  # "investment_professional" or "decision_maker"
+
 filtered: list[dict] = []
 for a in articles:
-    score = (a.get("relevance_scores") or {}).get(persona, 0)
+    score = (a.get("relevance_scores") or {}).get(active_persona, 0)
     if a.get("primary_category") not in selected_categories:
         continue
     if a.get("source") not in selected_sources:
@@ -139,11 +142,12 @@ for a in articles:
     filtered.append(a)
 
 # ---------------------------------------------------------------------------
-# Sorting
+# Sorting — sort key changes with active persona
 # ---------------------------------------------------------------------------
 if sort_by == "relevance":
+    _sort_key = active_persona
     filtered.sort(
-        key=lambda a: (a.get("relevance_scores") or {}).get(persona, 0),
+        key=lambda a: (a.get("relevance_scores") or {}).get(_sort_key, 0),
         reverse=True,
     )
 elif sort_by == "category":
@@ -151,9 +155,8 @@ elif sort_by == "category":
 else:
     filtered.sort(key=lambda a: a.get("source", ""))
 
-# Show count above threshold
-above = len(filtered)
-st.markdown(f"Zobrazeno **{above}** článků (z celkem {len(articles)})")
+# Show count under the slider
+count_placeholder.caption(f"Zobrazeno {len(filtered)} z {len(articles)} článků")
 st.markdown("---")
 
 # ---------------------------------------------------------------------------

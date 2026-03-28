@@ -188,6 +188,75 @@ def extract_text(file_bytes: bytes, file_type: str) -> str:
 CHUNK_MAX_CHARS = 25_000
 
 
+def segment_articles_from_docx(full_text: str, source_name: str) -> list[dict]:
+    """Split DOCX text into articles using structural delimiters.
+
+    Recognizes two delimiter patterns:
+    - A line of 20+ dashes (e.g. 50× '─' or '-')
+    - Section headers like ``[Ekonomika] zpráva | str. 5``
+
+    From each block extracts headline, author, full_text, article_type.
+    """
+    # Split by lines of 20+ dashes (ASCII or Unicode dash)
+    blocks = re.split(r'\r?\n[\-─]{20,}\r?\n', full_text)
+
+    # If only one block, try splitting by section headers
+    if len(blocks) <= 1:
+        header_re = re.compile(r'(\[.+?\]\s+.+?\|.*?str\.[^\n]*)', re.MULTILINE)
+        parts = header_re.split(full_text)
+        # parts = [before_first_header, header1, body1, header2, body2, ...]
+        if len(parts) > 2:
+            blocks = []
+            for j in range(1, len(parts), 2):
+                header = parts[j]
+                body = parts[j + 1] if j + 1 < len(parts) else ""
+                blocks.append(header + "\n" + body)
+
+    articles: list[dict] = []
+    for block in blocks:
+        block = block.strip()
+        if not block or len(block) < 30:
+            continue
+
+        # Check for section header at the start
+        section_match = re.match(r'^\[(.+?)\]\s+(.+?)\s*\|', block)
+        article_type = "zpráva"
+        if section_match:
+            article_type = section_match.group(2).strip()
+            # Remove the section header line
+            nl = block.find('\n')
+            block = block[nl + 1:].strip() if nl != -1 else block
+
+        lines = [l.strip() for l in block.split('\n') if l.strip()]
+        if not lines:
+            continue
+
+        headline = lines[0]
+
+        # Try to find author in first few lines
+        author = None
+        for line in lines[1:5]:
+            m = re.match(
+                r'^(?:autor[:\s]+|od\s+|napsal[a]?\s+)(.+)',
+                line,
+                re.IGNORECASE,
+            )
+            if m:
+                author = m.group(1).strip()
+                break
+
+        articles.append({
+            "headline": _normalize_text(headline),
+            "author": _normalize_text(author) if author else None,
+            "full_text": _normalize_text(block),
+            "article_type": _normalize_text(article_type),
+            "source": source_name,
+        })
+
+    print(f"DOCX segmentace: nalezeno {len(articles)} článků z '{source_name}'")
+    return articles
+
+
 def _split_into_chunks(text: str, max_chars: int = CHUNK_MAX_CHARS) -> list[str]:
     """Split *text* into chunks of at most *max_chars* characters.
 
@@ -418,7 +487,7 @@ def process_documents(
         all_articles: list[dict] = []
 
         # --- Phase 1: Extract text from all documents ---
-        texts: list[tuple[str, str]] = []  # (source_name, full_text)
+        texts: list[tuple[str, str, str]] = []  # (source_name, full_text, file_ext)
         for i, f_info in enumerate(uploaded_files, 1):
             name = f_info["name"]
             ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
@@ -430,10 +499,10 @@ def process_documents(
             )
 
             text = extract_text(f_info["data"], ext)
-            texts.append((source_name, text))
+            texts.append((source_name, text, ext))
 
         # --- Phase 2: Segment articles in each document ---
-        for i, (source_name, text) in enumerate(texts, 1):
+        for i, (source_name, text, ext) in enumerate(texts, 1):
             base_pct = 0.1 + 0.3 * ((i - 1) / len(texts))
             doc_pct_range = 0.3 / len(texts)
 
@@ -441,7 +510,11 @@ def process_documents(
                 _update(_base + _range * chunk_pct, f"{source_name}: {msg}")
 
             _update(base_pct, f"Segmentuji články (dokument {i}/{len(texts)}): {source_name}...")
-            articles = segment_articles(text, source_name, progress_callback=_seg_progress)
+
+            if ext == "docx":
+                articles = segment_articles_from_docx(text, source_name)
+            else:
+                articles = segment_articles(text, source_name, progress_callback=_seg_progress)
             all_articles.extend(articles)
 
         # --- Phase 3: Classify & summarize each article ---
