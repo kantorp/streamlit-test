@@ -191,9 +191,10 @@ for idx, art in enumerate(filtered):
     extended_key = f"extended{suffix}"
 
     summaries = art.get("summaries") or {}
+    full_text = art.get("full_text", "")
     headline_text = summaries.get(headline_key, art.get("headline", "Bez titulku"))
-    short_text = summaries.get(short_key, "")
-    extended_text = summaries.get(extended_key, "")
+    short_text = summaries.get(short_key) or full_text[:350]
+    extended_text = summaries.get(extended_key) or full_text[:800]
 
     cat = art.get("primary_category", "?")
     tags = art.get("secondary_tags") or []
@@ -217,22 +218,21 @@ for idx, art in enumerate(filtered):
         )
         st.markdown(badge_html, unsafe_allow_html=True)
 
-        # Row 2: headline
+        # Row 2: headline (bold, larger font)
         if is_excluded:
             st.markdown(
-                f"<h3 style='margin:4px 0;color:#777;text-decoration:line-through;'>"
-                f"{headline_text}</h3>",
+                f"<h2 style='margin:4px 0;color:#777;text-decoration:line-through;font-weight:700;'>"
+                f"{headline_text}</h2>",
                 unsafe_allow_html=True,
             )
         else:
             st.markdown(
-                f"<h3 style='margin:4px 0;'>{headline_text}</h3>",
+                f"<h2 style='margin:4px 0;font-weight:700;'>{headline_text}</h2>",
                 unsafe_allow_html=True,
             )
 
-        # Row 3: short summary
-        if short_text:
-            st.markdown(short_text)
+        # Row 3: short summary (always visible)
+        st.markdown(short_text)
 
         # Row 4: author | type
         st.caption(f"{author} | {art_type}")
