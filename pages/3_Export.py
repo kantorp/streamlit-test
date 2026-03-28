@@ -45,7 +45,7 @@ CATEGORY_COLORS_HEX = {
 
 PERSONA_LABELS = {
     "investment_professional": "📊 Investiční profesionál",
-    "decision_maker": "🏛️ Rozhodovatel",
+    "decision_maker": "🏛️ Generická role",
 }
 
 # ---------------------------------------------------------------------------

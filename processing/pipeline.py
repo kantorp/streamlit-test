@@ -172,6 +172,7 @@ def extract_text(file_bytes: bytes, file_type: str) -> str:
                 parts.append(_normalize_text(page_text))
         return "\n".join(parts)
 
+
     if file_type == "docx":
         doc = Document(io.BytesIO(file_bytes))
         return _normalize_text("\n".join(para.text for para in doc.paragraphs))
@@ -180,6 +181,19 @@ def extract_text(file_bytes: bytes, file_type: str) -> str:
         return _normalize_text(file_bytes.decode("utf-8", errors="replace"))
 
     raise ValueError(f"Unsupported file type: {file_type}")
+
+
+def extract_pdf_pages(file_bytes: bytes) -> list[str]:
+    """Extract text from each PDF page separately.
+
+    Returns a list of strings, one per page.
+    """
+    pages: list[str] = []
+    with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+        for page in doc:
+            page_text = page.get_text("text")
+            pages.append(_normalize_text(page_text))
+    return pages
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +360,89 @@ def segment_articles(
     return all_articles
 
 
+def segment_articles_from_pdf(
+    pages: list[str],
+    source_name: str,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> list[dict]:
+    """Segment articles from PDF by sending each page separately to Claude.
+
+    Each page is processed individually. Articles that continue from a previous
+    page are marked as continuation and merged with the preceding article.
+    """
+    client = _get_client()
+    total_pages = len(pages)
+
+    system_prompt = (
+        "Jsi expert na analýzu novinových textů. Dostaneš text z JEDNÉ stránky "
+        "novinové repliky \"" + source_name + "\" (stránka {page_num} z " + str(total_pages) + ").\n\n"
+        "Najdi na této stránce všechny články. U každého vrať JSON objekt s poli:\n"
+        "- \"headline\": titulek článku\n"
+        "- \"author\": autor článku, nebo null\n"
+        "- \"full_text\": celý text článku na této stránce\n"
+        "- \"article_type\": jeden z: zpráva, komentář, rozhovor, analýza, editorial, krátká-zpráva\n"
+        "- \"continuation\": true pokud článek pokračuje z předchozí stránky "
+        "(nemá vlastní titulek na této stránce, text plynule navazuje), jinak false\n\n"
+        "Pokud stránka obsahuje jen reklamu, kurzovní lístek, TV program, křížovku "
+        "nebo jiný neredakční obsah, vrať prázdný list [].\n\n"
+        "CRITICAL: Return ONLY a valid JSON array. No trailing commas. No comments. "
+        "No text before or after the JSON. Ensure all strings are properly escaped."
+    )
+
+    all_articles: list[dict] = []
+    failed_pages: list[int] = []
+
+    for idx, page_text in enumerate(pages, 1):
+        if progress_callback:
+            progress_callback(idx / total_pages, f"Segmentuji stránku {idx}/{total_pages}...")
+
+        page_text_stripped = page_text.strip()
+        if not page_text_stripped or len(page_text_stripped) < 20:
+            # Skip nearly empty pages
+            continue
+
+        prompt = system_prompt.replace("{page_num}", str(idx))
+
+        try:
+            raw = _call_claude(client, prompt, page_text_stripped, max_tokens=4096)
+            page_articles = _parse_json_response(raw)
+        except Exception as exc:
+            print(f"WARNING: Stránka {idx}/{total_pages} selhala: {exc}")
+            failed_pages.append(idx)
+            if idx < total_pages:
+                time.sleep(2)
+            continue
+
+        for art in page_articles:
+            art["source"] = source_name
+            for key in ("headline", "author", "full_text", "article_type"):
+                if isinstance(art.get(key), str):
+                    art[key] = _normalize_text(art[key])
+
+            is_continuation = art.pop("continuation", False)
+
+            if is_continuation and all_articles:
+                # Merge with the last article
+                prev = all_articles[-1]
+                prev["full_text"] = prev["full_text"] + "\n" + art.get("full_text", "")
+                # If the continuation has an author and previous doesn't, use it
+                if not prev.get("author") and art.get("author"):
+                    prev["author"] = art["author"]
+            else:
+                all_articles.append(art)
+
+        if idx < total_pages:
+            time.sleep(2)
+
+    ok_count = total_pages - len(failed_pages)
+    print(f"PDF segmentace po stránkách: {ok_count}/{total_pages} stránek zpracováno, "
+          f"nalezeno {len(all_articles)} článků z '{source_name}'.")
+    if failed_pages:
+        print(f"Selhané stránky: {failed_pages}")
+
+    return all_articles
+
+
 # ---------------------------------------------------------------------------
 # 3 & 4. Classification + Summarization (combined to save tokens)
 # ---------------------------------------------------------------------------
@@ -487,7 +584,9 @@ def process_documents(
         all_articles: list[dict] = []
 
         # --- Phase 1: Extract text from all documents ---
-        texts: list[tuple[str, str, str]] = []  # (source_name, full_text, file_ext)
+        # Each entry: (source_name, full_text_or_pages, file_ext)
+        # For PDFs we store per-page list; for others a single string.
+        docs: list[tuple[str, str | list[str], str]] = []
         for i, f_info in enumerate(uploaded_files, 1):
             name = f_info["name"]
             ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
@@ -498,23 +597,29 @@ def process_documents(
                 f"Extrahuji text (dokument {i}/{total_files}): {name}...",
             )
 
-            text = extract_text(f_info["data"], ext)
-            texts.append((source_name, text, ext))
+            if ext == "pdf":
+                pages = extract_pdf_pages(f_info["data"])
+                docs.append((source_name, pages, ext))
+            else:
+                text = extract_text(f_info["data"], ext)
+                docs.append((source_name, text, ext))
 
         # --- Phase 2: Segment articles in each document ---
-        for i, (source_name, text, ext) in enumerate(texts, 1):
-            base_pct = 0.1 + 0.3 * ((i - 1) / len(texts))
-            doc_pct_range = 0.3 / len(texts)
+        for i, (source_name, content, ext) in enumerate(docs, 1):
+            base_pct = 0.1 + 0.3 * ((i - 1) / len(docs))
+            doc_pct_range = 0.3 / len(docs)
 
             def _seg_progress(chunk_pct: float, msg: str, _base=base_pct, _range=doc_pct_range) -> None:
                 _update(_base + _range * chunk_pct, f"{source_name}: {msg}")
 
-            _update(base_pct, f"Segmentuji články (dokument {i}/{len(texts)}): {source_name}...")
+            _update(base_pct, f"Segmentuji články (dokument {i}/{len(docs)}): {source_name}...")
 
-            if ext == "docx":
-                articles = segment_articles_from_docx(text, source_name)
+            if ext == "pdf":
+                articles = segment_articles_from_pdf(content, source_name, progress_callback=_seg_progress)
+            elif ext == "docx":
+                articles = segment_articles_from_docx(content, source_name)
             else:
-                articles = segment_articles(text, source_name, progress_callback=_seg_progress)
+                articles = segment_articles(content, source_name, progress_callback=_seg_progress)
             all_articles.extend(articles)
 
         # --- Phase 3: Classify & summarize each article ---
