@@ -1,9 +1,10 @@
-import time
 import io
 
 import streamlit as st
 import fitz  # PyMuPDF
 from docx import Document
+
+from processing.pipeline import _get_api_key, process_documents
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -212,24 +213,39 @@ if raw_files:
     st.markdown("---")
     pub_date = st.date_input("Datum vydání", value=None, format="DD.MM.YYYY")
 
-    if st.button("🚀 Zpracovat dokumenty", type="primary"):
-        progress = st.progress(0)
-        status = st.empty()
+    # -----------------------------------------------------------------------
+    # API key check
+    # -----------------------------------------------------------------------
+    api_key = _get_api_key()
+    if not api_key:
+        st.warning("⚠️ Anthropic API klíč není nastaven. Nastavte proměnnou prostředí "
+                    "`ANTHROPIC_API_KEY` nebo ji přidejte do `.streamlit/secrets.toml`.")
+        manual_key = st.text_input("Nebo zadejte API klíč zde:", type="password",
+                                   key="manual_api_key")
+        if manual_key:
+            import os
+            os.environ["ANTHROPIC_API_KEY"] = manual_key
+            api_key = manual_key
 
-        steps = [
-            (0.2, "Načítání souborů…"),
-            (0.4, "Extrakce textu…"),
-            (0.6, "Analýza obsahu…"),
-            (0.8, "Generování briefu…"),
-            (1.0, "Hotovo!"),
-        ]
-        for pct, label in steps:
-            status.text(label)
-            progress.progress(pct)
-            time.sleep(0.6)
+    if st.button("🚀 Zpracovat dokumenty", type="primary", disabled=not api_key):
+        progress_bar = st.progress(0)
+        status_text = st.empty()
 
-        st.session_state.processing_complete = True
-        st.success("✅ Zpracování dokončeno.")
+        def update_progress(pct: float, msg: str) -> None:
+            progress_bar.progress(min(pct, 1.0))
+            status_text.text(msg)
+
+        try:
+            articles = process_documents(
+                uploaded_files=st.session_state.uploaded_files,
+                sources=st.session_state.detected_sources,
+                progress_callback=update_progress,
+            )
+            st.session_state["articles"] = articles
+            st.session_state.processing_complete = True
+            st.success(f"✅ Zpracování dokončeno. Nalezeno {len(articles)} článků.")
+        except RuntimeError as exc:
+            st.error(f"Chyba při zpracování: {exc}")
 
     # -----------------------------------------------------------------------
     # Post-processing link
